@@ -21,6 +21,7 @@ import {
   UniqueConstraintError,
 } from "../../errors";
 import type { AccessPattern, IndexMap } from "../../index-map";
+import { matchesResidual } from "../../pagination";
 import type {
   DynamoStore,
   QueryPage,
@@ -42,6 +43,7 @@ import {
   uniqueMarkerKey,
 } from "./key-codec";
 import { generateSchemaFile } from "./schema";
+import { andConditions, whereToCondition } from "./where-condition";
 
 type TransactItem = NonNullable<
   TransactWriteCommandInput["TransactItems"]
@@ -419,17 +421,22 @@ export function createSingleTableStore(
    * Guarded read-modify-write. `build` turns the current raw row into the
    * transaction that replaces it; a lost race re-reads and tries again rather
    * than surfacing a spurious failure for what is usually a benign interleave.
+   * `build` returns `null` when the row doesn't qualify for the write, which is
+   * answered like a missing row. When it does qualify, the revision guard
+   * makes sure the row written is the row `build` checked.
    */
   const guardedWrite = async <T>(
     model: string,
     id: string,
-    build: (existing: StoreItem) => { items: TransactItem[]; result: T },
+    build: (existing: StoreItem) => { items: TransactItem[]; result: T } | null,
     onMissing: () => T,
   ): Promise<T> => {
     for (let attempt = 1; attempt <= MAX_WRITE_ATTEMPTS; attempt++) {
       const existing = await readRaw(model, id);
       if (!existing) return onMissing();
-      const { items, result } = build(existing);
+      const built = build(existing);
+      if (!built) return onMissing();
+      const { items, result } = built;
       try {
         await sendTransaction(model, items);
         return result;
@@ -548,26 +555,42 @@ export function createSingleTableStore(
       );
     },
 
-    async consumeOne(model, id) {
+    async consumeOne(model, id, conditions = []) {
       // With no markers to move, a single conditional delete is already atomic
-      // and returns what it removed — no read needed.
-      if (uniquePatternsFor(model).length === 0) {
-        const res = await doc.send(
-          new DeleteCommand({
-            TableName: tableName,
-            Key: primaryKey(model, id),
-            ReturnValues: "ALL_OLD",
-          }),
-        );
-        const item = res.Attributes as StoreItem | undefined;
-        return isExpired(item) ? null : stripReserved(item);
+      // and returns what it removed — no read needed — as long as the
+      // caller's `where` can ride along as its condition.
+      const where = whereToCondition(conditions);
+      if (uniquePatternsFor(model).length === 0 && where !== null) {
+        try {
+          const res = await doc.send(
+            new DeleteCommand({
+              TableName: tableName,
+              Key: primaryKey(model, id),
+              ReturnValues: "ALL_OLD",
+              ...(where
+                ? {
+                    ConditionExpression: where.expression,
+                    ExpressionAttributeNames: where.names,
+                    ExpressionAttributeValues: where.values,
+                  }
+                : {}),
+            }),
+          );
+          const item = res.Attributes as StoreItem | undefined;
+          return isExpired(item) ? null : stripReserved(item);
+        } catch (err) {
+          if (isConditionalCheckFailed(err)) return null;
+          throw err;
+        }
       }
 
       // Otherwise the revision guard is what makes exactly one caller win: the
-      // loser's condition fails against an already-deleted row.
+      // loser's condition fails against an already-deleted row. It also pins
+      // the row the `where` was checked against to the one being deleted.
       const existing = await readRaw(model, id);
       if (!existing) return null;
       const clean = stripReserved(existing)!;
+      if (!matchesResidual(clean, conditions)) return null;
       try {
         await sendTransaction(model, [
           {
@@ -586,7 +609,7 @@ export function createSingleTableStore(
       return clean;
     },
 
-    async incrementOne(model, id, { increment, set }) {
+    async incrementOne(model, id, { increment, set, conditions = [] }) {
       const indexedFields = new Set(
         (indexMap[model] ?? []).flatMap((p) => [...p.pk, ...(p.sk ?? [])]),
       );
@@ -598,13 +621,17 @@ export function createSingleTableStore(
 
       // A native ADD cannot also re-encode GSI keys or the TTL attribute, so a
       // `set` that moves an indexed or TTL field goes the read-modify-write
-      // route instead of silently leaving stale index rows behind.
-      if (touchesIndex || touchesTtl) {
+      // route instead of silently leaving stale index rows behind. So does a
+      // `where` with no DynamoDB condition equivalent, checked in memory
+      // against the revision-guarded read instead.
+      const where = whereToCondition(conditions);
+      if (touchesIndex || touchesTtl || where === null) {
         return guardedWrite<StoreItem | null>(
           model,
           id,
           (existing) => {
             const clean = stripReserved(existing)!;
+            if (!matchesResidual(clean, conditions)) return null;
             const merged = { ...clean, ...(set ?? {}) };
             for (const [field, delta] of Object.entries(increment)) {
               const current = merged[field];
@@ -664,11 +691,19 @@ export function createSingleTableStore(
             TableName: tableName,
             Key: primaryKey(model, id),
             UpdateExpression: expression,
-            // Without this, `ADD` would happily create the row it was told to
-            // increment, turning "increment an existing counter" into an upsert.
-            ConditionExpression: "attribute_exists(#pk)",
-            ExpressionAttributeNames: names,
-            ExpressionAttributeValues: values,
+            // Without `attribute_exists`, `ADD` would happily create the row it
+            // was told to increment, turning "increment an existing counter"
+            // into an upsert. The `where` is checked against the row before
+            // this write, so `count < max` admits exactly one caller at
+            // `max - 1`.
+            ConditionExpression: where
+              ? andConditions(
+                  { expression: "attribute_exists(#pk)", topLevelOr: false },
+                  where,
+                )
+              : "attribute_exists(#pk)",
+            ExpressionAttributeNames: { ...names, ...where?.names },
+            ExpressionAttributeValues: { ...values, ...where?.values },
             ReturnValues: "ALL_NEW",
           }),
         );

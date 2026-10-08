@@ -1,5 +1,27 @@
 # @datar-platform/better-auth-dynamodb
 
+## Unreleased
+
+### Fixed
+
+- **`consumeOne` and `incrementOne` now check the whole `where` in the write.**
+  They resolved the row id with a read and then wrote by id alone, so every
+  other predicate was checked only against that read. Concurrent callers could
+  all pass: Better Auth's rate limiter (`count < max`) admitted 4 of a burst of
+  12 at `max = 3`, and a guarded consume or increment acted on a row that had
+  stopped matching. The built-in store now adds the predicates to the write's
+  `ConditionExpression`, or checks them against the revision-guarded read when
+  DynamoDB can't express them (case-insensitive, `ends_with`); a failed check
+  returns `null`, as for a missing row. The non-atomic fallbacks for stores
+  without these methods re-check the `where` too.
+
+### Changed
+
+- `DynamoStore.consumeOne` takes an optional third argument, `conditions`, and
+  `incrementOne`'s request an optional `conditions` field: the caller's whole
+  `where`. Existing stores keep compiling, but should check `conditions` in the
+  same write; see "Bring your own store" in the README.
+
 ## 0.2.2
 
 Documentation only — no runtime change.

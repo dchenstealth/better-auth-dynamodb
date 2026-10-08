@@ -193,6 +193,12 @@ const store: DynamoStore = {
   // which is what stops a one-time code being used twice) and `incrementOne`
   // (atomic counter). Without them the adapter falls back to a non-atomic
   // get-then-write. Also optional: `count()`, `createSchema()`.
+  consumeOne(model, id, conditions) {
+    /* delete only if the row still matches `conditions`, else return null */
+  },
+  incrementOne(model, id, { increment, set, conditions }) {
+    /* add/set only if the row still matches `conditions`, else return null */
+  },
 };
 
 // Describe which fields each model is looked up by:
@@ -207,6 +213,14 @@ const indexMap: IndexMap = {
 
 betterAuth({ database: dynamoAdapter({ store, indexMap }) });
 ```
+
+`consumeOne` and `incrementOne` receive the caller's whole `where` as
+`conditions`. The adapter resolves the row id with a read, so by the time the
+store writes, the row may no longer match: Better Auth's rate limiter, for
+example, increments only while `count < max`. Check `conditions` in the same
+write (the built-in store adds them to the `ConditionExpression`) and return
+`null` when they fail. A store that ignores them lets concurrent callers who
+all read a matching row all succeed.
 
 Given a `where`, the adapter takes the cheapest path it can prove: an `id`
 equality becomes a direct get, an `id in [...]` becomes a bounded set of gets,

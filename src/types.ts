@@ -1,5 +1,8 @@
 import type { DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
-import type { DBAdapterDebugLogOption } from "@better-auth/core/db/adapter";
+import type {
+  CleanedWhere,
+  DBAdapterDebugLogOption,
+} from "@better-auth/core/db/adapter";
 
 import type { IndexMap } from "./index-map";
 
@@ -74,26 +77,46 @@ export interface DynamoStore {
 
   /**
    * Optional atomic single-use consume: delete the record with the given `id`
-   * and return what was deleted (or `null` if it was already gone), in one
-   * operation. Better Auth's email-OTP/verification-token flows require this
-   * for correctness under concurrent verify attempts. When a store doesn't
-   * provide it, the adapter falls back to a non-atomic get-then-delete.
+   * and return what was deleted (or `null` if it was already gone, or no
+   * longer matches `conditions`), in one operation. Better Auth's
+   * email-OTP/verification-token flows require this for correctness under
+   * concurrent verify attempts. When a store doesn't provide it, the adapter
+   * falls back to a non-atomic get-then-delete.
+   *
+   * `conditions` is the caller's whole `where`. The adapter found `id` with a
+   * read, so by the time of the write the row may no longer match; a store
+   * must check `conditions` in the same write (e.g. as a `ConditionExpression`)
+   * and return `null` when they fail. A store that ignores them is atomic on
+   * the row's existence only. The adapter always passes it; it is optional so
+   * stores written against 0.2.x keep compiling.
    */
-  consumeOne?(model: string, id: string): Promise<StoreItem | null>;
+  consumeOne?(
+    model: string,
+    id: string,
+    conditions?: CleanedWhere[],
+  ): Promise<StoreItem | null>;
 
   /**
    * Optional atomic increment/set: apply `increment` (field -> delta) and
    * `set` (field -> value) to the record with the given `id` in one operation
-   * and return the updated record (or `null` if it doesn't exist). Better
-   * Auth's guarded-counter flows (e.g. rate-limit style attempt counters)
-   * require this for correctness under concurrent updates. When a store
-   * doesn't provide it, the adapter falls back to a non-atomic
-   * get-then-merge-then-update.
+   * and return the updated record (or `null` if it doesn't exist, or no
+   * longer matches `req.conditions`). Better Auth's guarded-counter flows
+   * (e.g. the rate limiter's `count < max`) require this for correctness under
+   * concurrent updates. When a store doesn't provide it, the adapter falls back
+   * to a non-atomic get-then-merge-then-update.
+   *
+   * `req.conditions` is the caller's whole `where`, with the same contract as
+   * `consumeOne`'s `conditions`: check it against the row as it was before
+   * this write, in the same write, and return `null` when it fails.
    */
   incrementOne?(
     model: string,
     id: string,
-    req: { increment: Record<string, number>; set?: StoreItem },
+    req: {
+      increment: Record<string, number>;
+      set?: StoreItem;
+      conditions?: CleanedWhere[];
+    },
   ): Promise<StoreItem | null>;
 
   /**

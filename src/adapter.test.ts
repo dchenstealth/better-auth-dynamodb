@@ -214,3 +214,84 @@ describe("page cap", () => {
     expect(pagesFetched).toBe(4);
   });
 });
+
+describe("consumeOne and incrementOne pass the whole where to the store", () => {
+  // The adapter finds the row with a read. Only the store's write can tell
+  // whether it still matches, so the store must see every clause, not just
+  // the id the read resolved.
+  const where = [
+    { field: "identifier", value: "otp:ada", operator: "eq" as const },
+    { field: "value", value: "123456", operator: "eq" as const },
+  ];
+  const row = { id: "v_1", identifier: "otp:ada", value: "123456" };
+
+  it("hands consumeOne its conditions", async () => {
+    const store = createSpyStore([row]);
+    const seen: unknown[] = [];
+    store.consumeOne = async (_m, _id, conditions) => {
+      seen.push(conditions);
+      return null;
+    };
+    const adapter = await adapterFor({ store, unsafeAllowScan: true });
+
+    await adapter.consumeOne({ model: "verification", where });
+    expect(seen).toEqual([
+      [
+        expect.objectContaining({ field: "identifier", value: "otp:ada" }),
+        expect.objectContaining({ field: "value", value: "123456" }),
+      ],
+    ]);
+  });
+
+  it("hands incrementOne its conditions", async () => {
+    const store = createSpyStore([row]);
+    const seen: unknown[] = [];
+    store.incrementOne = async (_m, _id, req) => {
+      seen.push(req.conditions);
+      return null;
+    };
+    const adapter = await adapterFor({ store, unsafeAllowScan: true });
+
+    await adapter.incrementOne({
+      model: "verification",
+      where,
+      increment: {},
+      set: { value: "654321" },
+    });
+    expect(seen).toEqual([
+      [
+        expect.objectContaining({ field: "identifier", value: "otp:ada" }),
+        expect.objectContaining({ field: "value", value: "123456" }),
+      ],
+    ]);
+  });
+
+  it("re-checks the where in the non-atomic fallbacks", async () => {
+    // The row changes between the adapter's lookup and the fallback's own
+    // read; the fallback must notice rather than act on the stale match.
+    const store = createSpyStore([row]);
+    let writes = 0;
+    store.deleteById = async () => {
+      writes++;
+    };
+    store.update = async () => {
+      writes++;
+      return null;
+    };
+    store.getById = async () => ({ ...row, value: "changed" });
+    const adapter = await adapterFor({ store, unsafeAllowScan: true });
+
+    await expect(
+      adapter.consumeOne({ model: "verification", where }),
+    ).resolves.toBeNull();
+    await expect(
+      adapter.incrementOne({
+        model: "verification",
+        where,
+        increment: {},
+        set: { value: "654321" },
+      }),
+    ).resolves.toBeNull();
+    expect(writes).toBe(0);
+  });
+});

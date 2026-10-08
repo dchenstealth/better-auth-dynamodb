@@ -1,3 +1,4 @@
+import type { CleanedWhere } from "@better-auth/core/db/adapter";
 import { beforeEach, describe, expect, it } from "vitest";
 
 import {
@@ -33,6 +34,21 @@ const store = (fake: FakeDynamo, overrides = {}) =>
 
 /** Marker rows are the ones under the unique-constraint key prefix. */
 const markers = (fake: FakeDynamo) => fake.rowsWithPrefix("U#");
+
+/** One `where` clause, as the adapter hands it to the store. */
+const cond = (
+  field: string,
+  operator: CleanedWhere["operator"],
+  value: CleanedWhere["value"],
+  extra: Partial<CleanedWhere> = {},
+): CleanedWhere => ({
+  field,
+  operator,
+  value,
+  connector: "AND",
+  mode: "sensitive",
+  ...extra,
+});
 
 describe("uniqueness markers", () => {
   let fake: FakeDynamo;
@@ -245,6 +261,45 @@ describe("consumeOne", () => {
       store(fake).consumeOne!("session", "nope"),
     ).resolves.toBeNull();
   });
+
+  it("checks the where in the single delete, and leaves a non-match", async () => {
+    const s = store(fake);
+    await s.put("audit", { id: "a_1", userId: "u_1" });
+
+    await expect(
+      s.consumeOne!("audit", "a_1", [cond("userId", "eq", "u_2")]),
+    ).resolves.toBeNull();
+    expect(fake.commands().at(-1)!.input.ConditionExpression).toBe("#w0 = :w0");
+    expect(await s.getById("audit", "a_1")).not.toBeNull();
+
+    await expect(
+      s.consumeOne!("audit", "a_1", [cond("userId", "eq", "u_1")]),
+    ).resolves.toMatchObject({ id: "a_1" });
+  });
+
+  it("checks the where against the guarded read when markers move", async () => {
+    const s = store(fake);
+    await s.put("session", { id: "s_1", token: "tok", userId: "u_1" });
+
+    await expect(
+      s.consumeOne!("session", "s_1", [cond("userId", "eq", "u_2")]),
+    ).resolves.toBeNull();
+    expect(markers(fake)).toHaveLength(1);
+    await expect(
+      s.consumeOne!("session", "s_1", [cond("userId", "eq", "u_1")]),
+    ).resolves.toMatchObject({ id: "s_1" });
+  });
+
+  it("falls back to the guarded read for a where DynamoDB can't express", async () => {
+    const s = store(fake);
+    await s.put("audit", { id: "a_1", userId: "U_1" });
+    const insensitive = cond("userId", "eq", "u_1", { mode: "insensitive" });
+
+    await expect(
+      s.consumeOne!("audit", "a_1", [insensitive]),
+    ).resolves.toMatchObject({ id: "a_1" });
+    expect(fake.commands().at(-1)!.type).toBe("TransactWriteCommand");
+  });
 });
 
 describe("incrementOne", () => {
@@ -294,6 +349,68 @@ describe("incrementOne", () => {
     await expect(
       s.incrementOne!("audit", "a_1", { increment: { count: 2 } }),
     ).resolves.toMatchObject({ count: 2 });
+  });
+
+  it("checks the where in the same update, against the row before it", async () => {
+    const s = store(fake);
+    await s.put("audit", { id: "a_1", userId: "u_1", count: 2 });
+    const underMax = [cond("count", "lt", 3)];
+
+    await expect(
+      s.incrementOne!("audit", "a_1", {
+        increment: { count: 1 },
+        conditions: underMax,
+      }),
+    ).resolves.toMatchObject({ count: 3 });
+    // The rate limiter's `count < max`: the next caller is refused, and the
+    // counter doesn't move.
+    await expect(
+      s.incrementOne!("audit", "a_1", {
+        increment: { count: 1 },
+        conditions: underMax,
+      }),
+    ).resolves.toBeNull();
+    expect(fake.commands().at(-1)!.input.ConditionExpression).toBe(
+      "attribute_exists(#pk) AND #w0 < :w0",
+    );
+    expect(await s.getById("audit", "a_1")).toMatchObject({ count: 3 });
+  });
+
+  it("checks the where on the read-modify-write route too", async () => {
+    const s = store(fake);
+    await s.put("audit", { id: "a_1", userId: "u_1", count: 0 });
+
+    // Moving an indexed field forces the guarded route.
+    await expect(
+      s.incrementOne!("audit", "a_1", {
+        increment: { count: 1 },
+        set: { userId: "u_2" },
+        conditions: [cond("count", "gt", 0)],
+      }),
+    ).resolves.toBeNull();
+    expect(await s.getById("audit", "a_1")).toMatchObject({
+      userId: "u_1",
+      count: 0,
+    });
+  });
+
+  it("falls back to the guarded route for a where DynamoDB can't express", async () => {
+    const s = store(fake);
+    await s.put("audit", { id: "a_1", userId: "u_1", note: "hello world" });
+
+    await expect(
+      s.incrementOne!("audit", "a_1", {
+        increment: { count: 1 },
+        conditions: [cond("note", "ends_with", "world")],
+      }),
+    ).resolves.toMatchObject({ count: 1 });
+    await expect(
+      s.incrementOne!("audit", "a_1", {
+        increment: { count: 1 },
+        conditions: [cond("note", "ends_with", "moon")],
+      }),
+    ).resolves.toBeNull();
+    expect(await s.getById("audit", "a_1")).toMatchObject({ count: 1 });
   });
 });
 

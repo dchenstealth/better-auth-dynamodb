@@ -70,8 +70,123 @@ function conditionHolds(
     case "attribute_exists(#pk) AND #rev = :rev":
       return current !== undefined && current[revAttr!] === values?.[":rev"];
     default:
-      throw new Error(`fake-dynamo: unmodelled condition "${expression}"`);
+      // Conditions built from a `where` clause.
+      return evaluateCondition(expression, names ?? {}, values ?? {}, current);
   }
+}
+
+/**
+ * A small evaluator for the condition grammar `whereToCondition` emits:
+ * `AND`/`OR`/`NOT`, parentheses, comparisons, `IN`, `attribute_exists`,
+ * `attribute_not_exists`, `begins_with` and `contains`. Comparisons between
+ * different types are false, as in DynamoDB.
+ */
+function evaluateCondition(
+  expression: string,
+  names: Record<string, string>,
+  values: Record<string, any>,
+  current: Item | undefined,
+): boolean {
+  const tokens = expression.match(/<>|<=|>=|[()<>=,]|[#:]?\w+/g) ?? [];
+  let pos = 0;
+  const peek = () => tokens[pos];
+  const next = () => tokens[pos++]!;
+  const expect = (t: string) => {
+    if (next() !== t)
+      throw new Error(`fake-dynamo: bad condition "${expression}"`);
+  };
+  const operand = (): any => {
+    const t = next();
+    if (t.startsWith("#")) return current?.[names[t]!];
+    if (t.startsWith(":")) return values[t];
+    throw new Error(`fake-dynamo: bad operand "${t}" in "${expression}"`);
+  };
+  const sameType = (a: any, b: any) =>
+    a !== undefined && b !== undefined && typeof a === typeof b;
+
+  const primary = (): boolean => {
+    const t = peek();
+    if (t === "(") {
+      next();
+      const v = or();
+      expect(")");
+      return v;
+    }
+    if (t === "NOT") {
+      next();
+      return !primary();
+    }
+    if (
+      t === "attribute_exists" ||
+      t === "attribute_not_exists" ||
+      t === "begins_with" ||
+      t === "contains"
+    ) {
+      next();
+      expect("(");
+      const a = operand();
+      let b: any;
+      if (peek() === ",") {
+        next();
+        b = operand();
+      }
+      expect(")");
+      if (t === "attribute_exists") return a !== undefined;
+      if (t === "attribute_not_exists") return a === undefined;
+      if (typeof a !== "string" || typeof b !== "string") return false;
+      return t === "begins_with" ? a.startsWith(b) : a.includes(b);
+    }
+    const a = operand();
+    const op = next();
+    if (op === "IN") {
+      expect("(");
+      const list = [operand()];
+      while (peek() === ",") {
+        next();
+        list.push(operand());
+      }
+      expect(")");
+      return a !== undefined && list.includes(a);
+    }
+    const b = operand();
+    switch (op) {
+      case "=":
+        return sameType(a, b) && a === b;
+      case "<>":
+        return a !== undefined && !(sameType(a, b) && a === b);
+      case "<":
+        return sameType(a, b) && a < b;
+      case "<=":
+        return sameType(a, b) && a <= b;
+      case ">":
+        return sameType(a, b) && a > b;
+      case ">=":
+        return sameType(a, b) && a >= b;
+      default:
+        throw new Error(`fake-dynamo: unmodelled operator "${op}"`);
+    }
+  };
+  const and = (): boolean => {
+    let v = primary();
+    while (peek() === "AND") {
+      next();
+      v = primary() && v;
+    }
+    return v;
+  };
+  const or = (): boolean => {
+    let v = and();
+    while (peek() === "OR") {
+      next();
+      v = and() || v;
+    }
+    return v;
+  };
+
+  const result = or();
+  if (pos !== tokens.length)
+    throw new Error(`fake-dynamo: unparsed condition "${expression}"`);
+  return result;
 }
 
 /** Apply the `SET`/`ADD` update expression shapes the store emits. */

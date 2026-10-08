@@ -322,13 +322,16 @@ export const dynamoAdapter = (
           const m = getDefaultModelName(model);
           const id = await resolveId(m, where);
           if (!id) return null;
+          // The whole `where` goes to the store, not just the id: the row was
+          // found by a read, and only the write can tell whether it still
+          // matches.
           if (store.consumeOne)
-            return (await store.consumeOne(m, id)) as T | null;
+            return (await store.consumeOne(m, id, where)) as T | null;
           // Fallback for stores without a native atomic delete-and-return: not
           // safe under true concurrency, but correct for the common single
           // in-flight verification case.
           const item = await store.getById(m, id);
-          if (!item) return null;
+          if (!item || !matchesResidual(item, where)) return null;
           await store.deleteById(m, id);
           return item as T;
         },
@@ -351,13 +354,14 @@ export const dynamoAdapter = (
             return (await store.incrementOne(m, id, {
               increment,
               set,
+              conditions: where,
             })) as T | null;
           }
           // Fallback for stores without a native atomic add/set: not safe
           // under true concurrency, but correct for the common single
           // in-flight update case.
           const current = await store.getById(m, id);
-          if (!current) return null;
+          if (!current || !matchesResidual(current, where)) return null;
           const patch: StoreItem = { ...set };
           for (const [field, delta] of Object.entries(increment)) {
             patch[field] = (Number(current[field]) || 0) + delta;
